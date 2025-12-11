@@ -9,7 +9,7 @@ from hashlib import sha1
 from torchvision.transforms import ToPILImage
 
 from latent_flow.models.vae import ConvVAE, ConvVAE2
-from latent_flow.trainers.aux import sample_z, update_progress, update_stdout
+from latent_flow.trainers.aux_trainer import sample_z, update_progress, update_stdout
 
 
 def tensor2image(tensor, adaptive=False):
