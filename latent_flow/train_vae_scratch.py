@@ -7,7 +7,7 @@ from torchvision import transforms
 
 from torchsummary import summary
 
-from latent_flow.trainers.aux import create_exp_dir
+from latent_flow.trainers.aux_trainer import create_exp_dir
 from latent_flow.models.vae import ConvVAE
 from latent_flow.models.DiffPDE import DiffPDE
 from latent_flow.models.HJPDE import HJPDE
