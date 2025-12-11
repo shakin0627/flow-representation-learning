@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import torchvision
 
-from latent_flow.trainers.aux import create_exp_dir
+from latent_flow.trainers.aux_trainer import create_exp_dir
 from latent_flow.datasets.Shapes3d import Shapes3D
 from latent_flow.models.vae import ConvVAE, ConvEncoder3
 from latent_flow.models.DiffPDE import DiffPDE
