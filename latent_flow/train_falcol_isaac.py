@@ -5,7 +5,7 @@ import torchvision
 from torchvision.datasets import MNIST
 from torch.utils.data import DataLoader
 
-from latent_flow.trainers.aux import create_exp_dir
+from latent_flow.trainers.aux_trainer import create_exp_dir
 from latent_flow.datasets.Falor3D import Falor3D
 from latent_flow.datasets.Isaac3D import Isaac3D
 from latent_flow.models.vae import ConvVAE2
