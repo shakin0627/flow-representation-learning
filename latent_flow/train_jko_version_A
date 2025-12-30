@@ -1,0 +1,176 @@
+import argparse
+import torch
+
+from torchvision.datasets import MNIST
+from torch.utils.data import DataLoader
+from torchvision import transforms
+
+from torchsummary import summary
+
+from latent_flow.trainers.aux_trainer import create_exp_dir
+from latent_flow.models.vae import ConvVAE
+from latent_flow.trainers.trainer_jko_em_truew2 import TrainerJKOEM, JKOSearchCfg
+
+import torch.nn as nn
+
+
+class SimpleGaussianTrans(nn.Module):
+    """
+    Minimal trans_model:
+      input:  k:[B,1] (int/float), z:[B,d], t:[B,1]
+      output: mean:[B,d], logvar:[B,d]
+    """
+    def __init__(self, d: int, num_support_sets: int, hidden: int = 512):
+        super().__init__()
+        self.num_support_sets = num_support_sets
+        self.k_embed = nn.Embedding(num_support_sets, min(64, hidden))
+        in_dim = d + 1 + self.k_embed.embedding_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 2 * d),
+        )
+
+    def forward(self, k, z, t01):
+        # k: [B,1] int64 or float -> int64
+        if k.dtype != torch.long:
+            k = k.long()
+        k = k.view(-1)  # [B]
+        ek = self.k_embed(k)  # [B,ek]
+        x = torch.cat([z, t01, ek], dim=-1)
+        out = self.net(x)
+        mean, logvar = out.chunk(2, dim=-1)
+        return mean, logvar
+
+
+def main():
+    """
+      - argparse -> build G, build trans/prior -> dataloader -> trainer -> train -> eval
+    """  
+
+    parser = argparse.ArgumentParser(description="JKO-EM (true W2) training script")
+
+    # === Condition / sequence =========================================================
+    parser.add_argument("-K", "--num-support-sets", type=int, required=True, help="number of conditions (k)")
+    parser.add_argument("-D", "--num-timesteps", type=int, required=True, help="number of timesteps")
+    parser.add_argument("--sigma-step", type=float, default=0.5, help="fallback sigma for transition if needed")
+
+    # === Optim =========================================================================
+    parser.add_argument("--generator_lr", type=float, default=1e-4, help="VAE lr")
+    parser.add_argument("--trans_lr", type=float, default=1e-4, help="transition lr")
+
+    # === Training ======================================================================
+    parser.add_argument("--max-iter", type=int, default=50000)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--log-freq", type=int, default=10)
+    parser.add_argument("--ckp-freq", type=int, default=1000)
+    parser.add_argument("--tensorboard", action="store_true")
+
+    # === JKO cfg =========================================================================
+    parser.add_argument("--tau", type=float, default=0.2)
+    parser.add_argument("--fp-iters", type=int, default=8)
+    parser.add_argument("--fp-damping", type=float, default=1.0)
+    parser.add_argument("--mc-samples", type=int, default=8)
+    parser.add_argument("--spd-eps", type=float, default=1e-6)
+
+    # === VOR + warmup ====================================================================
+    parser.add_argument("--vae-warmup-iters", type=int, default=2000, help="warmup only VAE for first N iters")
+    parser.add_argument("--weight-vor", type=float, default=0.0, help="VOR weight (0 disables)")
+
+    # === CUDA ============================================================================
+    parser.add_argument("--cuda", dest="cuda", action="store_true")
+    parser.add_argument("--no-cuda", dest="cuda", action="store_false")
+    parser.set_defaults(cuda=True)
+
+    # === Misc ============================================================================
+    parser.add_argument("--shapes3d", type=bool, default=False)
+    args = parser.parse_args()
+
+    # --- CUDA & multi-gpu (baseline style) :contentReference[oaicite:3]{index=3} ---
+    use_cuda = False
+    multi_gpu = False
+    device = "cpu"
+    if torch.cuda.is_available():
+        if args.cuda:
+            device = "cuda"
+            use_cuda = True
+            torch.set_default_tensor_type("torch.cuda.FloatTensor")
+            if torch.cuda.device_count() > 1:
+                multi_gpu = True
+        else:
+            print(
+                "*** WARNING ***: CUDA is available but disabled. Run with --cuda for speed."
+            )
+            torch.set_default_tensor_type("torch.FloatTensor")
+    else:
+        torch.set_default_tensor_type("torch.FloatTensor")
+
+    # --- Build Generator (same as baseline) :contentReference[oaicite:4]{index=4} ---
+    if args.shapes3d:
+        G = ConvVAE(num_channel=3, latent_size=15 * 15 + 1, img_size=64)
+        G.load_state_dict(torch.load("vae_shapes3d.pt", map_location="cpu"))
+        print("Initialize Shapes3D VAE")
+        args.gan_type = "VAE_Shapes"
+    else:
+        G = ConvVAE(num_channel=3, latent_size=18 * 18, img_size=28)
+        print("Initialize MNIST VAE")
+        args.gan_type = "VAE_MNIST"
+        summary(G, (3, 28, 28))
+
+    # --- Create exp dir (baseline style) :contentReference[oaicite:5]{index=5} ---
+    exp_dir = create_exp_dir(args)
+
+    # --- Build trans_model (replace with your real one if exists) ---
+    from latent_flow.models.trans_model import TransModelCfg, GaussianTransitionModel
+
+    cfg = TransModelCfg(
+        latent_dim=18*18,              # = G.latent_size
+        num_support_sets=args.num_support_sets,
+        width=512,
+        depth=4,
+        dropout=0.0,
+    )
+
+    trans_model = GaussianTransitionModel(cfg)
+
+    prior = nn.Identity()
+
+    # --- Dataset (same MNIST loader pattern) :contentReference[oaicite:6]{index=6} ---
+    print("MNIST DATASET LOADING")
+    dataset = MNIST(root="data", train=True, transform=transforms.ToTensor(), download=True)
+    data_loader = DataLoader(
+        dataset=dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        generator=torch.Generator(device=device),
+    )
+
+    # --- Build JKO cfg from args ---
+    jko_cfg = JKOSearchCfg(
+        tau=args.tau,
+        fp_iters=args.fp_iters,
+        fp_damping=args.fp_damping,
+        mc_samples=args.mc_samples,
+        spd_eps=args.spd_eps,
+    )
+
+    # --- Trainer ---
+    trn = TrainerJKOEM(
+        params=args,
+        exp_dir=exp_dir,
+        jko_cfg=jko_cfg,
+        use_cuda=use_cuda,
+        multi_gpu=multi_gpu,
+        data_loader=data_loader,
+    )
+
+    # --- Train then Eval (same pattern) :contentReference[oaicite:7]{index=7} ---
+    trn.train(generator=G, trans_model=trans_model, prior=prior)
+    trn.eval(generator=G, trans_model=trans_model, prior=prior)
+
+
+if __name__ == "__main__":
+    main()
