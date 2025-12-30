@@ -453,6 +453,180 @@ def compute_variational_optimality_residual(
     residual_S = (grad_S ** 2).sum(dim=(-2, -1))
     return (residual_m + residual_S).mean()
 
+# ------ aux ---------
+import math
+from PIL import Image
+import torchvision.utils as vutils
+from latent_flow.trainers.aux_trainer import create_summarizing_gif
+
+
+@torch.no_grad()
+def _save_grid(self, tensor_bchw: torch.Tensor, path: str, nrow: int = 8):
+    """
+    tensor_bchw: [B,3,H,W] in [0,1]
+    """
+    grid = vutils.make_grid(tensor_bchw.clamp(0, 1), nrow=nrow)
+    img = (grid.permute(1, 2, 0).cpu().numpy() * 255.0).astype("uint8")
+    Image.fromarray(img).save(path)
+
+
+@torch.no_grad()
+def _render_one_condition_path(
+    self,
+    *,
+    generator: nn.Module,
+    trans_model: Optional[nn.Module],
+    x0: torch.Tensor,            # [B,3,H,W] already colored
+    k_index: int,
+    iter_dir: str,
+    max_frames: Optional[int] = None,
+    sigma_step: float = 0.5,
+):
+    """
+    Save per-t frames:
+        frame_t.jpg is a grid of [x_t | x_hat_t | x_pred_t(optional)]
+    """
+    os.makedirs(iter_dir, exist_ok=True)
+
+    B = x0.size(0)
+    half_range = int(self.params.num_timesteps // 2)
+
+    # z0 from encoder
+    recon0, mean0, logvar0, _ = generator(x0)
+    S_prev = diag_cov_from_logvar(logvar0, eps=self.jko_cfg.spd_eps)
+    m_prev = mean0
+
+    # rollout z for free-pred branch
+    z_pred = None
+    if trans_model is not None:
+        # take a single rsample for rollout
+        std0 = torch.exp(0.5 * logvar0).clamp_min(self.jko_cfg.spd_eps)
+        z_pred = mean0 + std0 * torch.randn_like(std0)
+
+    # decide frames
+    T = half_range
+    if max_frames is not None:
+        T = min(T, max_frames)
+
+    for t in range(0, T + 1):
+        # build x_t (teacher)
+        if t == 0:
+            x_t = x0
+        else:
+            x_t = mnist_trans(x0, k_index, t)
+
+        # ---- teacher-forcing branch: inner solve -> decode ----
+        if t == 0:
+            x_hat = recon0
+        else:
+            t01 = torch.full((B, 1), float(t) / float(half_range), device=x0.device, dtype=x0.dtype)
+            k = torch.tensor(k_index, device=x0.device).view(1, 1)  # same shape convention as train
+            m_new, S_new, _ = jko_inner_solve_true_w2(
+                generator=generator,
+                trans_model=trans_model,
+                x_t=x_t,
+                m_prev=m_prev,
+                S_prev=S_prev,
+                k=k,
+                t01=t01,
+                cfg=self.jko_cfg,
+                fallback_sigma_step=sigma_step,
+            )
+
+            S_new_spd = spd_project(S_new, eps=self.jko_cfg.spd_eps)
+            L = torch.linalg.cholesky(S_new_spd)
+            eps = torch.randn(B, m_new.size(-1), device=x0.device, dtype=x0.dtype)
+            z_t = m_new + (L @ eps.unsqueeze(-1)).squeeze(-1)
+            x_hat = generator.inference(z_t)
+
+            # carry
+            m_prev = m_new
+            S_prev = S_new
+
+        # ---- free rollout branch (optional) ----
+        x_pred = None
+        if trans_model is not None and z_pred is not None and t > 0:
+            t01 = torch.full((B, 1), float(t) / float(half_range), device=x0.device, dtype=x0.dtype)
+            k_bs = torch.tensor(k_index, device=x0.device).view(1, 1).expand(B, 1)
+            mean_p, logvar_p = trans_model(k_bs, z_pred, t01)
+            z_pred = mean_p  # deterministic rollout (stable)
+            x_pred = generator.inference(z_pred)
+
+        # ---- concat panel: [gt | hat | pred(optional)] ----
+        if x_pred is None:
+            panel = torch.cat([x_t, x_hat], dim=0)   # [2B,3,H,W]
+            nrow = B
+        else:
+            panel = torch.cat([x_t, x_hat, x_pred], dim=0)  # [3B,3,H,W]
+            nrow = B
+
+        out_path = osp.join(iter_dir, f"{t:06}.jpg")
+        self._save_grid(panel, out_path, nrow=nrow)
+
+
+@torch.no_grad()
+def maybe_visualize(self, iteration: int, generator: nn.Module, trans_model: Optional[nn.Module], *, every: int = 2000):
+    """
+    Call inside train loop. Only runs after warmup.
+    """
+    if iteration <= self.vae_warmup_iters:
+        return
+    if every <= 0:
+        return
+    if iteration % int(every) != 0:
+        return
+
+    # pick a fixed mini-batch for visualization
+    generator.eval()
+    if trans_model is not None:
+        trans_model.eval()
+
+    # take the first batch (or you can cache a fixed batch in __init__)
+    x, _ = next(iter(self.data_loader))
+    if self.use_cuda:
+        x = x.cuda(non_blocking=True)
+    x = mnist_color(x)
+
+    # keep it small
+    B_vis = int(getattr(self.params, "vis_batch", 8))
+    x = x[:B_vis]
+
+    # choose a few k's to visualize
+    ks = getattr(self.params, "vis_ks", None)
+    if ks is None:
+        # default: 0, mid, last (avoid too many)
+        K = int(self.params.num_support_sets)
+        ks = sorted(list(set([0, K // 2, K - 1])))
+
+    vis_root = osp.join(self.wip_dir, "vis", f"iter_{iteration:06d}")
+    os.makedirs(vis_root, exist_ok=True)
+
+    sigma_step = float(getattr(self.params, "sigma_step", 0.5))
+
+    for k_index in ks:
+        img_dir = osp.join(vis_root, f"k_{k_index:03d}")
+        self._render_one_condition_path(
+            generator=generator,
+            trans_model=trans_model,
+            x0=x,
+            k_index=int(k_index),
+            iter_dir=img_dir,
+            max_frames=int(getattr(self.params, "vis_frames", self.params.num_timesteps // 2)),
+            sigma_step=sigma_step,
+        )
+        gif_path = osp.join(vis_root, f"summary_k{k_index:03d}.gif")
+        create_summarizing_gif(
+            imgs_root=img_dir,
+            gif_filename=gif_path,
+            num_imgs=None,
+            gif_size=64 if getattr(self.params, "shapes3d", False) else 28,
+            gif_fps=12,
+        )
+
+    # restore train mode
+    generator.train()
+    if trans_model is not None:
+        trans_model.train()
 
 # -----------------------------------------------------------------------------
 # Trainer (Scheme A) + VAE warmup + multi-gpu + checkpoint resume
@@ -727,6 +901,9 @@ class TrainerJKOEM(object):
                     print(f"      \\__ETA                 : {sec2dhms(eta)}")
                     print("         ===================================================================")
                     update_stdout(10)
+
+                # visualize
+                self.maybe_visualize(iteration, generator, trans_model, every=int(getattr(self.params, "vis_freq", 2000)))
 
                 # checkpoint
                 if iteration % int(self.params.ckp_freq) == 0:
