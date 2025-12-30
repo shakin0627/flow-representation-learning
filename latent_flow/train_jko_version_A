@@ -9,7 +9,7 @@ from torchsummary import summary
 
 from latent_flow.trainers.aux_trainer import create_exp_dir
 from latent_flow.models.vae import ConvVAE
-from latent_flow.trainers.trainer_jko_em_truew2 import TrainerJKOEM, JKOSearchCfg
+from latent_flow.trainers.trainer_jko_version_A import TrainerJKOEM, JKOSearchCfg
 
 import torch.nn as nn
 
