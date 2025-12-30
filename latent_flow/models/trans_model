@@ -1,0 +1,158 @@
+# trans_model.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# -------------------------
+# Time embedding (Fourier)
+# -------------------------
+
+class FourierTimeEmbedding(nn.Module):
+    """
+    Map t in [0,1] -> R^{2*m} using fixed Fourier features.
+    """
+    def __init__(self, m: int = 16, max_freq: float = 10.0):
+        super().__init__()
+        # frequencies: [m]
+        freqs = torch.exp(torch.linspace(0.0, torch.log(torch.tensor(max_freq)), m))
+        self.register_buffer("freqs", freqs)
+
+    def forward(self, t01: torch.Tensor) -> torch.Tensor:
+        # t01: [B,1]
+        x = t01 * self.freqs[None, :] * 2.0 * torch.pi  # [B,m]
+        return torch.cat([torch.sin(x), torch.cos(x)], dim=-1)  # [B,2m]
+
+
+# -------------------------
+# Residual MLP block
+# -------------------------
+
+class ResMLPBlock(nn.Module):
+    def __init__(self, dim: int, hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.norm = nn.LayerNorm(dim)
+        # small residual scale for stability
+        self.res_scale = nn.Parameter(torch.tensor(0.1))
+
+        # init: make it stable
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.weight)  # start near-identity
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc1(x)
+        h = F.silu(h)
+        h = self.dropout(h)
+        h = self.fc2(h)
+        x = x + self.res_scale * h
+        return self.norm(x)
+
+
+# -------------------------
+# Config
+# -------------------------
+
+@dataclass
+class TransModelCfg:
+    latent_dim: int
+    num_support_sets: int
+
+    # embeddings
+    k_embed_dim: int = 64
+    time_fourier_m: int = 16
+    time_fourier_max_freq: float = 10.0
+
+    # backbone
+    width: int = 512
+    depth: int = 4
+    dropout: float = 0.0
+
+    # output variance controls
+    logvar_min: float = -10.0
+    logvar_max: float = 3.0
+    init_logvar: float = -2.0  # initial std ~ exp(-1)=0.37
+
+
+# -------------------------
+# Transition Model
+# -------------------------
+
+class GaussianTransitionModel(nn.Module):
+    """
+    r_psi(z_t | z_{t-1}, k, t) = N(mean(z_{t-1},k,t), diag(exp(logvar(z_{t-1},k,t))))
+
+    Interface (matches your trainer):
+        mean, logvar = model(k, z_prev, t01)
+    """
+    def __init__(self, cfg: TransModelCfg):
+        super().__init__()
+        self.cfg = cfg
+        d = cfg.latent_dim
+
+        # embeddings
+        self.k_embed = nn.Embedding(cfg.num_support_sets, cfg.k_embed_dim)
+        self.t_embed = FourierTimeEmbedding(m=cfg.time_fourier_m, max_freq=cfg.time_fourier_max_freq)
+        tdim = 2 * cfg.time_fourier_m
+
+        # input projection
+        in_dim = d + cfg.k_embed_dim + tdim
+        self.in_proj = nn.Linear(in_dim, cfg.width)
+
+        # backbone
+        self.blocks = nn.ModuleList([
+            ResMLPBlock(dim=cfg.width, hidden=cfg.width, dropout=cfg.dropout)
+            for _ in range(cfg.depth)
+        ])
+
+        # heads
+        self.mean_head = nn.Sequential(
+            nn.Linear(cfg.width, cfg.width),
+            nn.SiLU(),
+            nn.Linear(cfg.width, d),
+        )
+        self.logvar_head = nn.Sequential(
+            nn.Linear(cfg.width, cfg.width),
+            nn.SiLU(),
+            nn.Linear(cfg.width, d),
+        )
+
+        # init heads: mean small, logvar around init_logvar
+        nn.init.zeros_(self.mean_head[-1].weight)
+        nn.init.zeros_(self.mean_head[-1].bias)
+
+        nn.init.zeros_(self.logvar_head[-1].weight)
+        nn.init.constant_(self.logvar_head[-1].bias, cfg.init_logvar)
+
+    def forward(self, k: torch.Tensor, z_prev: torch.Tensor, t01: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        k:    [B,1] (int64 preferred; if float -> will be cast)
+        z:    [B,d]
+        t01:  [B,1] in [0,1]
+        """
+        if k.dtype != torch.long:
+            k = k.long()
+        k = k.view(-1)  # [B]
+        ek = self.k_embed(k)              # [B, k_embed_dim]
+        et = self.t_embed(t01)            # [B, 2m]
+
+        x = torch.cat([z_prev, ek, et], dim=-1)  # [B, d + kdim + tdim]
+        h = self.in_proj(x)                      # [B, width]
+        h = F.silu(h)
+
+        for blk in self.blocks:
+            h = blk(h)
+
+        mean = self.mean_head(h)                 # [B,d]
+        logvar = self.logvar_head(h)             # [B,d]
+        logvar = torch.clamp(logvar, min=self.cfg.logvar_min, max=self.cfg.logvar_max)
+
+        return mean, logvar
