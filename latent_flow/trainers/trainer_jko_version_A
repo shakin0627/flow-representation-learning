@@ -1,0 +1,892 @@
+"""
+trainer_jko_em_truew2_vorA.py
+
+Scheme A (truncated implicit BP):
+  - Inner JKO-prox solve in restricted Gaussian family runs under torch.no_grad()
+      * mean m has closed-form
+      * covariance Sigma uses FP iteration with TRUE Gaussian-W2 covariance term
+  - Outer loop optimizes reconstruction + (optional) VOR (variational optimality residual)
+      * VOR re-computes stationarity gradients at (m_new, S_new) and backprops to:
+          - generator (via encoder posterior terms)
+          - trans_model (via reachable term)
+      * BUT DOES NOT backprop through inner solver (m_new, S_new detached)
+
+Modifications requested:
+  1) add VAE warmup iters (vae_warmup_iters)
+  2) remove non-existing classification objectives
+  3) move transforms / angle_set etc to "macros" under imports
+  4) add multi-gpu DataParallelPassthrough block
+  5) add get_starting_iteration(...) compatible with (support_sets removed) but keep prior
+  6) confirm VAE ELBO includes KL(q(z0|x0)||p(z0))  -> YES (see vae_elbo_loss)
+  7) clarify S_prev: only t=0 uses diagonal from encoder; then S_prev becomes full SPD from JKO solve
+"""
+
+from __future__ import annotations
+
+import os
+import os.path as osp
+import time
+import json
+import shutil
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict
+
+import torch
+import torch.backends.cudnn as cudnn
+from torch import nn
+from torch.nn import DataParallel
+from torch.distributions import Normal
+from latent_flow.trainers.aux_trainer import (
+    TrainingStatTracker,
+    update_progress,
+    update_stdout,
+    sec2dhms,
+)
+from latent_flow.datasets.transforms import AddRandomTransformationDims, To_Color
+
+# -----------------------------------------------------------------------------
+# Macros / Transforms config (moved here per request)
+# -----------------------------------------------------------------------------
+
+torch.autograd.set_detect_anomaly(True)
+
+
+angle_set = [0, 10, 20, 30, 40, 50, 60, 70, 80]
+color_set = [180, 200, 220, 240, 260, 280, 300, 320, 340]
+scale_set = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8]
+mnist_trans = AddRandomTransformationDims(angle_set=angle_set, color_set=color_set, scale_set=scale_set)
+mnist_color = To_Color()
+
+# -----------------------------------------------------------------------------
+# DataParallel passthrough (so .inference works transparently)
+# -----------------------------------------------------------------------------
+
+class DataParallelPassthrough(DataParallel):
+    """DataParallel that forwards attribute access to underlying module."""
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+
+# -----------------------------------------------------------------------------
+# Utils: SPD ops (batch)
+# -----------------------------------------------------------------------------
+
+def _symmetrize(A: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (A + A.transpose(-1, -2))
+
+
+def spd_project(A: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Project a batch of matrices to SPD by eigenvalue clamping."""
+    A = _symmetrize(A)
+    w, V = torch.linalg.eigh(A)
+    w = torch.clamp(w, min=eps)
+    return (V * w.unsqueeze(-2)) @ V.transpose(-1, -2)
+
+
+def spd_inv(A: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Inverse of SPD matrix batch via Cholesky."""
+    A = spd_project(A, eps=eps)
+    L = torch.linalg.cholesky(A)
+    I = torch.eye(A.size(-1), device=A.device, dtype=A.dtype).expand_as(A)
+    return torch.cholesky_solve(I, L)
+
+
+def spd_logdet(A: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """log det for SPD batch."""
+    A = spd_project(A, eps=eps)
+    L = torch.linalg.cholesky(A)
+    return 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
+
+
+def spd_sqrtm(A: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Matrix square-root for SPD batch via eigh (differentiable)."""
+    A = spd_project(A, eps=eps)
+    w, V = torch.linalg.eigh(A)
+    w = torch.clamp(w, min=eps)
+    return (V * torch.sqrt(w).unsqueeze(-2)) @ V.transpose(-1, -2)
+
+
+def spd_invsqrtm(A: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Matrix inverse square-root for SPD batch via eigh (differentiable)."""
+    A = spd_project(A, eps=eps)
+    w, V = torch.linalg.eigh(A)
+    w = torch.clamp(w, min=eps)
+    return (V * (1.0 / torch.sqrt(w)).unsqueeze(-2)) @ V.transpose(-1, -2)
+
+
+def diag_cov_from_logvar(log_var: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Build diagonal covariance matrix from log-variance. log_var: [B,d] -> Sigma: [B,d,d]."""
+    var = torch.exp(log_var).clamp_min(eps)
+    return torch.diag_embed(var)
+
+
+# -----------------------------------------------------------------------------
+# Gaussian KL (kept for logging / optional outer terms)
+# -----------------------------------------------------------------------------
+
+def gaussian_kl(
+    m: torch.Tensor,
+    S: torch.Tensor,
+    mt: torch.Tensor,
+    St: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """KL( N(m,S) || N(mt,St) ) for a batch. returns [B]."""
+    d = m.size(-1)
+    St_inv = spd_inv(St, eps=eps)
+    diff = (mt - m).unsqueeze(-1)
+    tr_term = torch.einsum("bij,bjk->bik", St_inv, S).diagonal(dim1=-2, dim2=-1).sum(-1)
+    quad = (diff.transpose(-1, -2) @ St_inv @ diff).squeeze(-1).squeeze(-1)
+    logdet_ratio = spd_logdet(St, eps=eps) - spd_logdet(S, eps=eps)
+    return 0.5 * (tr_term + quad - d + logdet_ratio)
+
+
+# -----------------------------------------------------------------------------
+# JKO config
+# -----------------------------------------------------------------------------
+
+@dataclass
+class JKOSearchCfg:
+    # JKO step size
+    tau: float = 0.2
+
+    # covariance FP iters
+    fp_iters: int = 8
+    fp_damping: float = 1.0  # <1 can help stability; 1.0 = no damping
+
+    # MC samples for bar_g = E[g(z_{t-1})]
+    mc_samples: int = 8
+
+    # numerical
+    spd_eps: float = 1e-6
+
+
+# -----------------------------------------------------------------------------
+# Inner solver (no_grad): reachable estimate + mean closed-form + cov FP (true W2)
+# -----------------------------------------------------------------------------
+
+@torch.no_grad()
+def estimate_bar_g_and_Sigma_r(
+    *,
+    m_prev: torch.Tensor,       # [B,d]
+    S_prev: torch.Tensor,       # [B,d,d]
+    k: torch.Tensor,            # [1,1] or [B,1]
+    t01: torch.Tensor,          # [B,1]
+    trans_model: Optional[nn.Module],
+    cfg: JKOSearchCfg,
+    fallback_sigma_step: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Estimate bar_g = E[g(z_{t-1},k,t)] and Sigma_r for reachable Gaussian.
+
+    Returns:
+        bar_g:   [B,d]
+        Sigma_r: [B,d,d] (diagonal, from predicted logvar or fallback isotropic)
+    """
+    device = m_prev.device
+    dtype = m_prev.dtype
+    B, d = m_prev.shape
+    S = int(cfg.mc_samples)
+
+    S_prev_spd = spd_project(S_prev, eps=cfg.spd_eps)
+    L_prev = torch.linalg.cholesky(S_prev_spd)  # [B,d,d]
+    eps = torch.randn(B, S, d, device=device, dtype=dtype)
+    z_prev = m_prev[:, None, :] + torch.einsum("bij,bsj->bsi", L_prev, eps)  # [B,S,d]
+
+    if trans_model is None:
+        bar_g = z_prev.mean(dim=1)
+        Sigma_r = (fallback_sigma_step ** 2) * torch.eye(d, device=device, dtype=dtype)
+        Sigma_r = Sigma_r.unsqueeze(0).expand(B, -1, -1)
+        return bar_g, Sigma_r
+
+    z_flat = z_prev.reshape(B * S, d)
+    k_bs = k.expand(B, 1)
+    k_flat = k_bs.repeat_interleave(S, dim=0)  # [B*S,1]
+    t_flat = t01.repeat_interleave(S, dim=0)   # [B*S,1]
+
+    mean_r_flat, logvar_r_flat = trans_model(k_flat, z_flat, t_flat)
+    mean_r = mean_r_flat.reshape(B, S, d)
+    bar_g = mean_r.mean(dim=1)
+
+    var_r = torch.exp(logvar_r_flat).reshape(B, S, d).clamp_min(cfg.spd_eps)
+    var_r_bar = var_r.mean(dim=1)
+    Sigma_r = torch.diag_embed(var_r_bar)
+    return bar_g, Sigma_r
+
+
+@torch.no_grad()
+def jko_mean_closed_form_expected_kl(
+    *,
+    m_prev: torch.Tensor,        # [B,d]
+    mu_x: torch.Tensor,          # [B,d]
+    Lambda_x: torch.Tensor,      # [B,d,d]
+    bar_g: torch.Tensor,         # [B,d]
+    Lambda_r: torch.Tensor,      # [B,d,d]
+    cfg: JKOSearchCfg,
+) -> torch.Tensor:
+    """(1/tau)(m-m_-) + Lambda_x(m-mu_x) + Lambda_r(m-bar_g) = 0."""
+    tau = float(cfg.tau)
+    B, d = m_prev.shape
+    I = torch.eye(d, device=m_prev.device, dtype=m_prev.dtype).unsqueeze(0).expand(B, -1, -1)
+    A = (1.0 / tau) * I + Lambda_x + Lambda_r
+    b = (1.0 / tau) * m_prev.unsqueeze(-1) + (Lambda_x @ mu_x.unsqueeze(-1)) + (Lambda_r @ bar_g.unsqueeze(-1))
+    m = torch.linalg.solve(A, b).squeeze(-1)
+    return m
+
+
+@torch.no_grad()
+def w2_A_matrix(
+    *,
+    S_prev: torch.Tensor,   # [B,d,d]
+    S: torch.Tensor,        # [B,d,d]
+    cfg: JKOSearchCfg,
+) -> torch.Tensor:
+    """A(S) := Sigma_-^{1/2} (Sigma_-^{1/2} Sigma Sigma_-^{1/2})^{-1/2} Sigma_-^{1/2}."""
+    S_prev_sqrt = spd_sqrtm(S_prev, eps=cfg.spd_eps)
+    X = S_prev_sqrt @ S @ S_prev_sqrt
+    X_invsqrt = spd_invsqrtm(X, eps=cfg.spd_eps)
+    A = S_prev_sqrt @ X_invsqrt @ S_prev_sqrt
+    return spd_project(A, eps=cfg.spd_eps)
+
+
+@torch.no_grad()
+def jko_cov_fp_true_w2(
+    *,
+    S_init: torch.Tensor,       # [B,d,d]
+    S_prev: torch.Tensor,       # [B,d,d]
+    Lambda_x: torch.Tensor,     # [B,d,d]
+    Lambda_r: torch.Tensor,     # [B,d,d]
+    cfg: JKOSearchCfg,
+) -> torch.Tensor:
+    """FP iteration for Sigma using true Gaussian-W2 cov term + KL entropy."""
+    tau = float(cfg.tau)
+    damp = float(cfg.fp_damping)
+
+    S_prev_spd = spd_project(S_prev, eps=cfg.spd_eps)
+    S = spd_project(S_init, eps=cfg.spd_eps)
+
+    B, d, _ = S.shape
+    I = torch.eye(d, device=S.device, dtype=S.dtype).unsqueeze(0).expand(B, -1, -1)
+
+    Lambda_x = spd_project(Lambda_x, eps=cfg.spd_eps)
+    Lambda_r = spd_project(Lambda_r, eps=cfg.spd_eps)
+
+    for _ in range(int(cfg.fp_iters)):
+        A = w2_A_matrix(S_prev=S_prev_spd, S=S, cfg=cfg)
+        M = 0.5 * (Lambda_x + Lambda_r) + (1.0 / (2.0 * tau)) * (I - A)
+        S_next = spd_inv(M, eps=cfg.spd_eps)
+
+        if damp != 1.0:
+            S = spd_project((1.0 - damp) * S + damp * S_next, eps=cfg.spd_eps)
+        else:
+            S = spd_project(S_next, eps=cfg.spd_eps)
+
+    return S
+
+
+@torch.no_grad()
+def jko_inner_solve_true_w2(
+    *,
+    generator: nn.Module,
+    trans_model: Optional[nn.Module],
+    x_t: torch.Tensor,          # [B,...]
+    m_prev: torch.Tensor,       # [B,d]
+    S_prev: torch.Tensor,       # [B,d,d]
+    k: torch.Tensor,            # [1,1] or [B,1]
+    t01: torch.Tensor,          # [B,1]
+    cfg: JKOSearchCfg,
+    fallback_sigma_step: float,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    """One inner JKO-prox solve (no_grad), returning (m_new, S_new)."""
+    _, mu_x, logvar_x, _ = generator(x_t)
+    S_x = diag_cov_from_logvar(logvar_x, eps=cfg.spd_eps)
+    Lambda_x = spd_inv(S_x, eps=cfg.spd_eps)
+
+    bar_g, S_r = estimate_bar_g_and_Sigma_r(
+        m_prev=m_prev,
+        S_prev=S_prev,
+        k=k,
+        t01=t01,
+        trans_model=trans_model,
+        cfg=cfg,
+        fallback_sigma_step=fallback_sigma_step,
+    )
+    Lambda_r = spd_inv(S_r, eps=cfg.spd_eps)
+
+    m_new = jko_mean_closed_form_expected_kl(
+        m_prev=m_prev,
+        mu_x=mu_x,
+        Lambda_x=Lambda_x,
+        bar_g=bar_g,
+        Lambda_r=Lambda_r,
+        cfg=cfg,
+    )
+
+    S_new = jko_cov_fp_true_w2(
+        S_init=S_prev,
+        S_prev=S_prev,
+        Lambda_x=Lambda_x,
+        Lambda_r=Lambda_r,
+        cfg=cfg,
+    )
+
+    info = {
+        "bar_g_norm": bar_g.norm(dim=-1).mean(),
+        "mu_x_norm": mu_x.norm(dim=-1).mean(),
+    }
+    return m_new, S_new, info
+
+
+# -----------------------------------------------------------------------------
+# VOR (Version A): with-grad re-forward for stationarity residual
+# -----------------------------------------------------------------------------
+
+def estimate_bar_g_and_Sigma_r_with_grad(
+    *,
+    m_prev: torch.Tensor,       # [B,d] (pass detach from caller)
+    S_prev: torch.Tensor,       # [B,d,d] (pass detach from caller)
+    k: torch.Tensor,
+    t01: torch.Tensor,
+    trans_model: Optional[nn.Module],
+    cfg: JKOSearchCfg,
+    fallback_sigma_step: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Same as estimate_bar_g_and_Sigma_r, but keeps autograd for trans_model params."""
+    device = m_prev.device
+    dtype = m_prev.dtype
+    B, d = m_prev.shape
+    S = int(cfg.mc_samples)
+
+    S_prev_spd = spd_project(S_prev, eps=cfg.spd_eps)
+    L_prev = torch.linalg.cholesky(S_prev_spd)
+    eps = torch.randn(B, S, d, device=device, dtype=dtype)
+    z_prev = m_prev[:, None, :] + torch.einsum("bij,bsj->bsi", L_prev, eps)  # [B,S,d]
+
+    if trans_model is None:
+        bar_g = z_prev.mean(dim=1)
+        Sigma_r = (fallback_sigma_step ** 2) * torch.eye(d, device=device, dtype=dtype)
+        Sigma_r = Sigma_r.unsqueeze(0).expand(B, -1, -1)
+        return bar_g, Sigma_r
+
+    z_flat = z_prev.reshape(B * S, d)
+    k_bs = k.expand(B, 1)
+    k_flat = k_bs.repeat_interleave(S, dim=0)
+    t_flat = t01.repeat_interleave(S, dim=0)
+
+    mean_r_flat, logvar_r_flat = trans_model(k_flat, z_flat, t_flat)
+    mean_r = mean_r_flat.reshape(B, S, d)
+    bar_g = mean_r.mean(dim=1)
+
+    var_r = torch.exp(logvar_r_flat).reshape(B, S, d).clamp_min(cfg.spd_eps)
+    var_r_bar = var_r.mean(dim=1)
+    Sigma_r = torch.diag_embed(var_r_bar)
+    return bar_g, Sigma_r
+
+
+def w2_A_matrix_with_grad(*, S_prev: torch.Tensor, S: torch.Tensor, cfg: JKOSearchCfg) -> torch.Tensor:
+    """A(S) but keeping autograd if S_prev/S are in graph (we'll pass detached S_prev, and detached S in VOR-A)."""
+    S_prev_sqrt = spd_sqrtm(S_prev, eps=cfg.spd_eps)
+    X = S_prev_sqrt @ S @ S_prev_sqrt
+    X_invsqrt = spd_invsqrtm(X, eps=cfg.spd_eps)
+    A = S_prev_sqrt @ X_invsqrt @ S_prev_sqrt
+    return spd_project(A, eps=cfg.spd_eps)
+
+
+def compute_variational_optimality_residual(
+    *,
+    m_new: torch.Tensor,   # [B,d] (numeric, no grad)
+    S_new: torch.Tensor,   # [B,d,d] (numeric, no grad)
+    generator: nn.Module,
+    trans_model: Optional[nn.Module],
+    x_t: torch.Tensor,     # [B,...]
+    m_prev: torch.Tensor,  # [B,d] (numeric state)
+    S_prev: torch.Tensor,  # [B,d,d] (numeric state)
+    k: torch.Tensor,       # [1,1] or [B,1]
+    t01: torch.Tensor,     # [B,1]
+    cfg: JKOSearchCfg,
+    fallback_sigma_step: float,
+) -> torch.Tensor:
+    """VOR-A: compute stationarity residual at (m_new,S_new), backprop to generator/trans_model only."""
+    device = m_new.device
+    dtype = m_new.dtype
+    B, d = m_new.shape
+    tau = float(cfg.tau)
+
+    # re-forward encoder posterior for x_t (WITH grad)
+    _, mu_x, logvar_x, _ = generator(x_t)
+    S_x = diag_cov_from_logvar(logvar_x, eps=cfg.spd_eps)
+    Lambda_x = spd_inv(S_x, eps=cfg.spd_eps)
+
+    # reachable term (WITH grad to trans_model params)
+    bar_g, S_r = estimate_bar_g_and_Sigma_r_with_grad(
+        m_prev=m_prev.detach(),
+        S_prev=S_prev.detach(),
+        k=k,
+        t01=t01,
+        trans_model=trans_model,
+        cfg=cfg,
+        fallback_sigma_step=fallback_sigma_step,
+    )
+    Lambda_r = spd_inv(S_r, eps=cfg.spd_eps)
+
+    # treat inner solution as constant (truncated implicit BP)
+    m0 = m_new.detach()
+    S0 = spd_project(S_new.detach(), eps=cfg.spd_eps)
+
+    I = torch.eye(d, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+
+    # grad wrt m
+    grad_m = (1.0 / tau) * (m0 - m_prev.detach()) \
+        + (Lambda_x @ (m0 - mu_x).unsqueeze(-1)).squeeze(-1) \
+        + (Lambda_r @ (m0 - bar_g).unsqueeze(-1)).squeeze(-1)  # [B,d]
+
+    # grad wrt S (Frobenius form)
+    S0_inv = spd_inv(S0, eps=cfg.spd_eps)
+    A = w2_A_matrix_with_grad(S_prev=spd_project(S_prev.detach(), eps=cfg.spd_eps), S=S0, cfg=cfg)
+    Lambda_sum = spd_project(0.5 * (Lambda_x + Lambda_r), eps=cfg.spd_eps)
+
+    grad_S = (1.0 / (2.0 * tau)) * (I - A) + Lambda_sum - S0_inv  # [B,d,d]
+
+    residual_m = (grad_m ** 2).sum(dim=-1)
+    residual_S = (grad_S ** 2).sum(dim=(-2, -1))
+    return (residual_m + residual_S).mean()
+
+
+# -----------------------------------------------------------------------------
+# Trainer (Scheme A) + VAE warmup + multi-gpu + checkpoint resume
+# -----------------------------------------------------------------------------
+
+class TrainerJKOEM(object):
+    """EM-style block-wise trainer (Scheme A) + true Gaussian-W2 covariance term + VOR-A."""
+
+    def __init__(
+        self,
+        params,
+        exp_dir: str,
+        jko_cfg: Optional[JKOSearchCfg] = None,
+        use_cuda: bool = False,
+        multi_gpu: bool = False,
+        data_loader=None,
+    ):
+        self.params = params
+        self.use_cuda = use_cuda
+        self.multi_gpu = multi_gpu
+        self.data_loader = data_loader
+        self.jko_cfg = jko_cfg or JKOSearchCfg()
+
+        # warmup iters
+        self.vae_warmup_iters = int(getattr(self.params, "vae_warmup_iters", 0))
+
+        # VOR weight
+        self.weight_vor = float(getattr(self.params, "weight_vor", 0.0))
+
+        self.tensorboard = getattr(self.params, "tensorboard", False)
+
+        self.wip_dir = osp.join("experiments", "wip", exp_dir)
+        self.complete_dir = osp.join("experiments", "complete", exp_dir)
+        os.makedirs(self.wip_dir, exist_ok=True)
+
+        self.stats_json = osp.join(self.wip_dir, "stats.json")
+        if not osp.isfile(self.stats_json):
+            with open(self.stats_json, "w") as out:
+                json.dump({}, out)
+
+        self.models_dir = osp.join(self.wip_dir, "models")
+        os.makedirs(self.models_dir, exist_ok=True)
+        self.checkpoint = osp.join(self.models_dir, "checkpoint.pt")
+
+        self.stat_tracker = TrainingStatTracker()
+        self.iter_times = []
+
+    # ---------------- losses ----------------
+
+    def vae_elbo_loss(self, recon_x, x, mean, log_var):
+        """
+        Standard VAE ELBO:
+          recon (BCE) + KL(q(z|x) || N(0,I))
+        => This DOES include KL(q(z0|x0) || p(z0)=N(0,I)).
+        """
+        bce = torch.nn.functional.binary_cross_entropy(
+            recon_x.view(x.size(0), -1), x.view(x.size(0), -1), reduction="sum"
+        )
+        kld = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        return (bce + kld) / x.size(0)
+
+    def recon_bce(self, recon_x, x):
+        bce = torch.nn.functional.binary_cross_entropy(
+            recon_x.view(x.size(0), -1), x.view(x.size(0), -1), reduction="sum"
+        )
+        return bce / x.size(0)
+
+    # ---------------- checkpoint ----------------
+
+    def get_starting_iteration(self, generator: nn.Module, trans_model: Optional[nn.Module], prior: Optional[nn.Module]):
+        """
+        Requested API:
+            def get_starting_iteration(self, support_sets, generator, prior):
+        We removed support_sets from this trainer, but keep prior + generator (+ trans_model).
+        """
+        starting_iter = 1
+        if osp.isfile(self.checkpoint):
+            ckpt = torch.load(self.checkpoint, map_location="cpu")
+            starting_iter = int(ckpt.get("iter", 1))
+
+            if "vae" in ckpt:
+                generator.load_state_dict(ckpt["vae"])
+
+            if trans_model is not None and "trans" in ckpt:
+                trans_model.load_state_dict(ckpt["trans"])
+
+            if prior is not None and "prior" in ckpt:
+                prior.load_state_dict(ckpt["prior"])
+
+        return starting_iter
+
+    def save_checkpoint(self, iteration: int, generator: nn.Module, trans_model: Optional[nn.Module], prior: Optional[nn.Module]):
+        ckpt = {"iter": int(iteration), "vae": generator.state_dict()}
+        if trans_model is not None:
+            ckpt["trans"] = trans_model.state_dict()
+        if prior is not None:
+            ckpt["prior"] = prior.state_dict()
+        torch.save(ckpt, self.checkpoint)
+
+    # ---------------- training ----------------
+
+    def train(self, generator: nn.Module, trans_model: Optional[nn.Module] = None, prior: Optional[nn.Module] = None):
+        # device / mode
+        if self.use_cuda:
+            generator = generator.cuda().train()
+            if trans_model is not None:
+                trans_model = trans_model.cuda().train()
+            if prior is not None:
+                prior = prior.cuda().train()
+        else:
+            generator = generator.train()
+            if trans_model is not None:
+                trans_model = trans_model.train()
+            if prior is not None:
+                prior = prior.train()
+
+        # multi-gpu
+        if self.multi_gpu and torch.cuda.device_count() > 1:
+            print("#. Parallelize generator over {} GPUs...".format(torch.cuda.device_count()))
+            generator = DataParallelPassthrough(generator)
+            if trans_model is not None:
+                trans_model = DataParallelPassthrough(trans_model)
+            if prior is not None:
+                prior = DataParallelPassthrough(prior)
+            cudnn.benchmark = True
+
+        vae_optim = torch.optim.Adam(generator.parameters(), lr=self.params.generator_lr)
+        trans_optim = None
+        if trans_model is not None:
+            trans_optim = torch.optim.Adam(
+                trans_model.parameters(),
+                lr=getattr(self.params, "trans_lr", getattr(self.params, "support_set_lr", 1e-4)),
+            )
+
+        starting_iter = self.get_starting_iteration(generator, trans_model, prior)
+        print(f"#. Start training from iteration {starting_iter}")
+
+        t0 = time.time()
+        iteration = int(starting_iter)
+        max_iter = int(self.params.max_iter)
+        half_range = int(self.params.num_timesteps // 2)
+        sigma_step = float(getattr(self.params, "sigma_step", 0.5))
+
+        while iteration <= max_iter:
+            for i, (x, _) in enumerate(self.data_loader):
+                iteration += 1
+                if iteration > max_iter:
+                    break
+
+                iter_t0 = time.time()
+                vae_optim.zero_grad(set_to_none=True)
+                if trans_optim is not None:
+                    trans_optim.zero_grad(set_to_none=True)
+
+                if self.use_cuda:
+                    x = x.cuda(non_blocking=True)
+
+                x = mnist_color(x)
+                B = x.size(0)
+
+                # choose one transform index per batch
+                index = torch.randint(0, self.params.num_support_sets, (1, 1), device=x.device)
+
+                # ---- block 0: VAE ELBO on x0 ----
+                recon_x0, mean0, log_var0, z0 = generator(x)
+                loss0 = self.vae_elbo_loss(recon_x0, x, mean0, log_var0)
+
+                # warmup: only train VAE for first vae_warmup_iters steps
+                if self.vae_warmup_iters > 0 and iteration <= self.vae_warmup_iters:
+                    loss0.backward()
+                    vae_optim.step()
+
+                    loss_total = loss0.detach()
+                else:
+                    # initialize Gaussian state mu_0 = N(m_prev, S_prev)
+                    # NOTE: at t=0, S_prev is diagonal because encoder outputs diagonal log_var.
+                    # After first JKO update, S_prev becomes FULL covariance (S_new).
+                    m_prev = mean0.detach()
+                    S_prev = diag_cov_from_logvar(log_var0.detach(), eps=self.jko_cfg.spd_eps)
+
+                    loss_total = loss0  # keep graph here (for VAE params)
+
+                    # ---- blocks t=1..T/2 : inner JKO solve (no_grad) + outer recon + VOR ----
+                    for t in range(1, half_range + 1):
+                        # build x_t (no grad)
+                        with torch.no_grad():
+                            x_t = mnist_trans(x, index, t)
+                            t01 = torch.full((B, 1), float(t) / float(half_range), device=x.device, dtype=x.dtype)
+
+                            # inner solve (no_grad)
+                            m_new, S_new, _info = jko_inner_solve_true_w2(
+                                generator=generator,
+                                trans_model=trans_model,
+                                x_t=x_t,
+                                m_prev=m_prev,
+                                S_prev=S_prev,
+                                k=index,
+                                t01=t01,
+                                cfg=self.jko_cfg,
+                                fallback_sigma_step=sigma_step,
+                            )
+
+                        # outer recon term: sample z_t ~ N(m_new, S_new) (treated as constant state)
+                        S_new_spd = spd_project(S_new, eps=self.jko_cfg.spd_eps)
+                        L = torch.linalg.cholesky(S_new_spd)
+                        eps = torch.randn(B, m_new.size(-1), device=x.device, dtype=x.dtype)
+                        z_t = m_new + (L @ eps.unsqueeze(-1)).squeeze(-1)
+
+                        x_hat = generator.inference(z_t)
+                        recon_loss = self.recon_bce(x_hat, x_t)
+
+                        # extra ELBO placeholders (keep explicit)
+                        extra_elbo = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
+                        # VOR-A (optional)
+                        if self.weight_vor > 0.0:
+                            vor = compute_variational_optimality_residual(
+                                m_new=m_new,
+                                S_new=S_new,
+                                generator=generator,
+                                trans_model=trans_model,
+                                x_t=x_t,
+                                m_prev=m_prev,
+                                S_prev=S_prev,
+                                k=index,
+                                t01=t01,
+                                cfg=self.jko_cfg,
+                                fallback_sigma_step=sigma_step,
+                            )
+                        else:
+                            vor = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
+                        block_loss = recon_loss + extra_elbo + self.weight_vor * vor
+                        loss_total = loss_total + block_loss
+
+                        # carry numerical state forward
+                        m_prev = m_new.detach()
+                        S_prev = S_new.detach()
+
+                    # one backward for the whole sequence (cleaner than stepping per-block)
+                    loss_total.backward()
+                    if trans_optim is not None:
+                        trans_optim.step()
+                    vae_optim.step()
+
+                    loss_total = loss_total.detach()
+
+                # stats (remove classification fields)
+                self.stat_tracker.update(
+                    total_loss=float(loss_total.item()),
+                )
+
+                # timing
+                iter_t = time.time()
+                self.iter_times.append(iter_t - iter_t0)
+                elapsed = iter_t - t0
+                mean_iter = float(sum(self.iter_times) / max(1, len(self.iter_times)))
+                eta = elapsed * ((max_iter - iteration) / max(1, (iteration - starting_iter + 1)))
+
+                # logging
+                if iteration % int(self.params.log_freq) == 0:
+                    update_progress(
+                        f"  \\__.Training [bs: {B}] [iter: {iteration:06d}/{max_iter:06d}] ",
+                        max_iter,
+                        iteration + 1,
+                    )
+                    print()
+                    print(f"      \\__Total loss          : {loss_total.item():.08f}")
+                    print("         ===================================================================")
+                    print(f"      \\__Mean iter time      : {mean_iter:.3f} sec")
+                    print(f"      \\__Elapsed time        : {sec2dhms(elapsed)}")
+                    print(f"      \\__ETA                 : {sec2dhms(eta)}")
+                    print("         ===================================================================")
+                    update_stdout(10)
+
+                # checkpoint
+                if iteration % int(self.params.ckp_freq) == 0:
+                    self.save_checkpoint(iteration, generator, trans_model, prior)
+
+        # done
+        elapsed = time.time() - t0
+        print(f"#.Training completed -- Total elapsed time: {sec2dhms(elapsed)}.")
+        print(f"#. Copy {self.wip_dir} to {self.complete_dir}...")
+        try:
+            shutil.copytree(src=self.wip_dir, dst=self.complete_dir, ignore=shutil.ignore_patterns("checkpoint.pt"))
+            print("  \\__Done!")
+        except IOError as e:
+            print(f"  \\__Already exists -- {e}")
+
+    from torch.distributions import Normal
+
+    @torch.no_grad()
+    def eval(self, generator, trans_model=None, prior=None):
+        """
+        Eval for Version A:
+        - keep dataloader/mnist_color/mnist_trans usage similar to baseline
+        - report:
+            (1) logpx on x0: negative ELBO under p(z)=N(0,I)
+            (2) logpx transformed: along (index, t) trajectory using transition p_psi(z_t|z_{t-1},k,t)
+            (3) eq err: rollout pixel error using transition mean (or sampled) + decode
+        """
+
+        neg_likelihood = []
+
+        # resume (kept baseline behavior)
+        _ = self.get_starting_iteration(generator=generator, trans_model=trans_model, prior=prior)
+
+        generator.eval()
+        if trans_model is not None:
+            trans_model.eval()
+        if prior is not None:
+            prior.eval()
+
+        prior_z0 = Normal(0.0, 1.0)
+
+        # -------------------------
+        # (1) logpx on x0 (neg-ELBO)
+        # -------------------------
+        for i, (x, y) in enumerate(self.data_loader):
+            if self.use_cuda:
+                x = x.cuda(non_blocking=True)
+                x = mnist_color(x)
+
+            recon_x, mean, log_var, z = generator(x)  # q(z0|x0)
+            std = torch.exp(0.5 * log_var).clamp_min(self.jko_cfg.spd_eps)
+            q = Normal(mean, std)
+
+            z_rs = q.rsample()  # rsample ok even under no_grad; same as sample here
+            log_q_z = q.log_prob(z_rs).flatten(start_dim=1).sum(-1, keepdim=True)
+
+            log_p_z = prior_z0.log_prob(z_rs).flatten(start_dim=1).sum(-1, keepdim=True)
+
+            # p(x|z): keep baseline choice Normal(loc=recon_x, scale=1.0)
+            p_x = Normal(loc=recon_x, scale=1.0)
+            neg_logpx_z = -p_x.log_prob(x).flatten(start_dim=1).sum(-1, keepdim=True) + log_p_z - log_q_z
+
+            neg_likelihood.append(neg_logpx_z.mean())
+
+        print("logpx (x0 neg-ELBO)", (sum(neg_likelihood) / len(neg_likelihood)).item())
+
+        # ---------------------------------------------
+        # (2) logpx transformed along trajectory (neg-ELBO)
+        #     using transition p_psi(z_t|z_{t-1},k,t)
+        # ---------------------------------------------
+        neg_likelihood_transformed = []
+        half_range = self.params.num_timesteps // 2
+
+        for i, (x, y) in enumerate(self.data_loader):
+            if self.use_cuda:
+                x = x.cuda(non_blocking=True)
+                x = mnist_color(x)
+
+            B = x.size(0)
+
+            # Loop over conditions like baseline
+            for index in range(0, self.params.num_support_sets):
+
+                # Start from x0 posterior sample (teacher forcing chain)
+                recon_x0, mean0, log_var0, _ = generator(x)
+                std0 = torch.exp(0.5 * log_var0).clamp_min(self.jko_cfg.spd_eps)
+                q0 = Normal(mean0, std0)
+                z_prev = q0.rsample()  # z0
+
+                for t in range(1, half_range):
+                    x_t = mnist_trans(x, index, t)
+
+                    # q(z_t|x_t)
+                    recon_xt, mean_t, log_var_t, _ = generator(x_t)
+                    std_t = torch.exp(0.5 * log_var_t).clamp_min(self.jko_cfg.spd_eps)
+                    q_t = Normal(mean_t, std_t)
+
+                    z_t = q_t.rsample()
+                    log_q = q_t.log_prob(z_t).flatten(start_dim=1).sum(-1, keepdim=True)
+
+                    # p(z_t|z_{t-1},k,t): from trans_model if available else fallback Gaussian step
+                    if trans_model is not None:
+                        k_bs = torch.tensor(index, device=x.device).view(1, 1).expand(B, 1)
+                        t01 = (t / float(half_range)) * torch.ones(B, 1, device=x.device, dtype=x.dtype)
+                        mean_p, logvar_p = trans_model(k_bs, z_prev, t01)
+                        std_p = torch.exp(0.5 * logvar_p).clamp_min(self.jko_cfg.spd_eps)
+                    else:
+                        mean_p = z_prev
+                        std_p = float(getattr(self.params, "sigma_step", 0.5)) * torch.ones_like(z_prev)
+
+                    p_z = Normal(mean_p, std_p)
+                    log_p = p_z.log_prob(z_t).flatten(start_dim=1).sum(-1, keepdim=True)
+
+                    # p(x_t|z_t) = Normal(recon_xt, 1)
+                    p_x = Normal(loc=recon_xt, scale=1.0)
+                    neg_logpx_z = -p_x.log_prob(x_t).flatten(start_dim=1).sum(-1, keepdim=True) + log_p - log_q
+
+                    neg_likelihood_transformed.append(neg_logpx_z.mean())
+
+                    # advance chain
+                    z_prev = z_t
+
+        print("logpx transformed (traj neg-ELBO)", (sum(neg_likelihood_transformed) / len(neg_likelihood_transformed)).item())
+
+        # -------------------------
+        # (3) eq err: rollout pixel error
+        # -------------------------
+        eq_err_all = []
+
+        for index in range(0, self.params.num_support_sets):
+            for i, (x, y) in enumerate(self.data_loader):
+                if self.use_cuda:
+                    x = x.cuda(non_blocking=True)
+                    x = mnist_color(x)
+
+                B = x.size(0)
+
+                # z0 from q(z0|x0)
+                _, mean0, log_var0, _ = generator(x)
+                std0 = torch.exp(0.5 * log_var0).clamp_min(self.jko_cfg.spd_eps)
+                q0 = Normal(mean0, std0)
+                z = q0.rsample()
+
+                eq_loss = 0.0
+                for t in range(1, half_range):
+                    x_t = mnist_trans(x, index, t)
+
+                    # rollout in latent using transition mean (more stable than sampling)
+                    if trans_model is not None:
+                        k_bs = torch.tensor(index, device=x.device).view(1, 1).expand(B, 1)
+                        t01 = (t / float(half_range)) * torch.ones(B, 1, device=x.device, dtype=x.dtype)
+                        mean_p, logvar_p = trans_model(k_bs, z, t01)
+                        z = mean_p
+                    # else: identity
+
+                    img_shifted = generator.inference(z)
+                    eq_loss = eq_loss + (img_shifted - x_t).abs().sum() / x_t.size(0)
+
+                eq_err_all.append(eq_loss)
+
+            print("eq err", index, (sum(eq_err_all) / len(eq_err_all)).item())
+
+        return None
